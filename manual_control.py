@@ -41,23 +41,27 @@ camera = world.spawn_actor(camera_bp, camera_spawn, attach_to=vehicle)
 
 # Spawn other vehicles for simulated traffic
 traffic_manager = client.get_trafficmanager(8000)
-num_vehicles = 5
 traffic_vehicles = []
 spawn_points = world.get_map().get_spawn_points()
-for i in range(num_vehicles):
+# Cap NPC count at the number of available spawn points so we don't IndexError.
+num_vehicles = min(5, len(spawn_points))
+for _ in range(num_vehicles):
     bp = random.choice(blueprint_library.filter('vehicle.*'))
-    npc = world.try_spawn_actor(bp, spawn_points[i])
+    spawn = random.choice(spawn_points)
+    npc = world.try_spawn_actor(bp, spawn)
     if npc:
-        npc.set_autopilot(True, traffic_manager.get_port())  # traffic manager controls it
+        npc.set_autopilot(True, traffic_manager.get_port())
         traffic_vehicles.append(npc)
 
 # Image rendering
 def process_image(image):
     img_array = np.frombuffer(image.raw_data, dtype=np.uint8)
     img_array = img_array.reshape((image.height, image.width, 4))[:, :, :3]
+    # CARLA gives BGRA; swap to RGB so colours display correctly.
+    img_array = img_array[:, :, ::-1]
     img_array = np.rot90(img_array, 1)  # Rotate 90° counter-clockwise
     surface = pygame.surfarray.make_surface(img_array)
-    surface = pygame.transform.flip(surface, True, False) 
+    surface = pygame.transform.flip(surface, True, False)
     display.blit(surface, (0, 0))
     pygame.display.flip()
 

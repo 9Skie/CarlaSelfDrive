@@ -1,32 +1,25 @@
 '''
-this script will turn the neural network we made into a stable baselines agent
+SB3 policy configuration for the CARLA TD3 agent.
 
-How it fits together:
-- CarlaTD3Policy is what gets passed to TD3(...) — SB3 expects a Policy class here
-- CarlaTD3Policy subclasses TD3Policy and overrides make_actor() to plug in our custom network
-- CarlaActor is the actual actor: it wraps CarlaPolicyNetwork and slots into SB3's TD3 internals
-- SB3 handles the critic, target networks, exploration noise, and gradient updates automatically
+The previous version tried to subclass TD3Policy/Actor to plug a custom
+CarlaPolicyNetwork straight into SB3 — but SB3's Actor receives features from
+SB3's own features extractor, not the raw dict the custom network expected, so
+the wiring never lined up.
+
+The idiomatic approach is to keep SB3's default MlpPolicy and plug in a custom
+features extractor (CarlaFeaturesExtractor) that fuses the depth + seg cameras
+with the scalar sensor vector into a flat feature vector. SB3 then builds the
+actor/critic heads, target networks, exploration noise, and gradient updates
+itself.
 '''
 
-import torch.nn as nn
-from stable_baselines3.td3.policies import TD3Policy, Actor
+from stable_baselines3.common.type_aliases import PolicyKwargsDict
 
-from carla_self_driving_nn import CarlaPolicyNetwork
-
-
-class CarlaActor(Actor):
-    def __init__(self, observation_space, action_space, net_arch, features_extractor, features_dim, activation_fn=nn.ReLU, normalize_images=True):
-        super().__init__(observation_space, action_space, net_arch, features_extractor, features_dim, activation_fn, normalize_images)
-        self.custom_net = CarlaPolicyNetwork()
-
-    def forward(self, obs):
-        return self.custom_net(obs)
-
-    def _predict(self, observation, deterministic=False):
-        return self(observation)
+from carla_self_driving_nn import CarlaFeaturesExtractor
 
 
-class CarlaTD3Policy(TD3Policy):
-    def make_actor(self, features_extractor=None):
-        actor_kwargs = self._update_features_extractor(self.actor_kwargs, features_extractor)
-        return CarlaActor(**actor_kwargs).to(self.device)
+def default_policy_kwargs(features_dim: int = CarlaFeaturesExtractor.DEFAULT_FEATURES_DIM) -> PolicyKwargsDict:
+    return {
+        'features_extractor_class': CarlaFeaturesExtractor,
+        'features_extractor_kwargs': {'features_dim': features_dim},
+    }

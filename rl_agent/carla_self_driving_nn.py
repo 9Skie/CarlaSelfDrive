@@ -1,12 +1,20 @@
 '''
-this script contains the neural network (and stable baselines model adaptation) that is going to serve as the agent for the carla 
+Neural network building blocks + SB3 features extractor for the CARLA agent.
 
+The features extractor fuses two camera streams (depth, segmentation) with the
+scalar sensor vector into a flat feature vector that SB3's standard MlpPolicy
+can consume. This is the idiomatic way to mix image + vector observations in
+SB3 — no custom Actor/Policy subclass needed.
 '''
 
 import torch
 from torch import nn
-import numpy as np
 import gymnasium as gym
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+
+# 600x800 input through CarlaCNN.cnn flattens to 16 * 16 * 21 = 5376
+_CNN_FLATTEN_DIM = 5376
 
 
 class CarlaCNN(nn.Module):
@@ -23,14 +31,13 @@ class CarlaCNN(nn.Module):
             nn.LeakyReLU(),
             nn.Dropout(p=dropout),
             nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Flatten()
+            nn.Flatten(),
         )
 
-        self.fc = nn.Linear(5040, output_features) # you can calculate this with that cnn formula...
+        self.fc = nn.Linear(_CNN_FLATTEN_DIM, output_features)
 
     def forward(self, obs_image):
         return self.fc(self.cnn(obs_image))
-    
 
 
 class CarlaDNN(nn.Module):
@@ -52,93 +59,61 @@ class CarlaDNN(nn.Module):
         return self.dnn(obs)
 
 
+class CarlaFeaturesExtractor(BaseFeaturesExtractor):
+    '''
+    Fuses depth + segmentation cameras with the scalar sensor vector into a
+    flat feature vector of size `features_dim` (default 3072 = 1024 * 3).
 
-class CarlaPolicyNetwork(nn.Module):
+    SB3 normalizes uint8 images to [0,1] float and adds a batch dim before
+    passing obs to forward(), so we receive [B, H, W, C] tensors.
+    '''
 
-    def __init__(self, image_output_dim=1024, state_output_dim=1024, hidden_dim=512, action_dim=3, dropout=0.2):
-        super().__init__()
+    DEFAULT_FEATURES_DIM = 3072
 
-        self.depth_net = CarlaCNN(output_features=image_output_dim, dropout=dropout)
-        self.seg_net = CarlaCNN(output_features=image_output_dim, dropout=dropout)
-        self.feature_net = CarlaDNN(input_features=14, hidden_features=512, output_features=state_output_dim, dropout=dropout)
+    def __init__(self, observation_space: gym.Space, features_dim: int = DEFAULT_FEATURES_DIM):
+        assert isinstance(observation_space, gym.spaces.Dict), 'CarlaFeaturesExtractor needs a Dict observation_space'
 
-        self.policy_head = nn.Sequential(
-            nn.Linear(2*image_output_dim + state_output_dim, hidden_dim),
-            nn.LeakyReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, action_dim)  # assume [throttle, brake, steer] as 3 outputs
+        super().__init__(observation_space, features_dim)
+
+        spaces = observation_space.spaces
+        per_stream = features_dim // 3
+
+        self.depth_net = CarlaCNN(output_features=per_stream)
+        self.seg_net = CarlaCNN(output_features=per_stream)
+
+        sensor_dim = (
+            spaces['collision_sensor'].shape[0]
+            + spaces['velocity'].shape[0]
+            + spaces['acceleration'].shape[0]
+            + spaces['angular_velocity'].shape[0]
+            + spaces['throttle'].shape[0]
+            + spaces['brake'].shape[0]
+            + spaces['steer'].shape[0]
+            + spaces['speed'].shape[0]
+        )
+        self.feature_net = CarlaDNN(input_features=sensor_dim, output_features=per_stream)
+
+    def forward(self, obs: dict) -> torch.Tensor:
+        # SB3 hands us [B, H, W, C]; Conv2d wants [B, C, H, W]
+        depth = obs['depth_camera'].permute(0, 3, 1, 2)
+        seg = obs['seg_camera'].permute(0, 3, 1, 2)
+
+        sensor = torch.cat(
+            [
+                obs['collision_sensor'].float(),
+                obs['velocity'],
+                obs['acceleration'],
+                obs['angular_velocity'],
+                obs['throttle'],
+                obs['brake'],
+                obs['steer'],
+                obs['speed'],
+            ],
+            dim=-1,
         )
 
-    def forward(self, obs):
+        depth_f = self.depth_net(depth)
+        seg_f = self.seg_net(seg)
+        sensor_f = self.feature_net(sensor)
 
-        depth_features = self.depth_net(obs["depth_camera"])             # [B, 1024]
-        seg_features = self.seg_net(obs["seg_camera"])                   # [B, 1024]
-        other_features = self.feature_net(obs["sensor_data"])                           # [B, 1024]
-        combined = torch.cat([depth_features, seg_features, other_features], dim=1)   # [B, 3092]
-
-        raw_actions = self.policy_head(combined)     # [B, 3]
-        throttle = torch.sigmoid(raw_actions[:, 0])  # Normalize throttle to range [0, 1]
-        brake = torch.sigmoid(raw_actions[:, 1])     # Normalize brake to range [0, 1]
-        steer = torch.tanh(raw_actions[:, 2])        # Normalize steer to range [-1, 1]
-        
-        return torch.stack([throttle, brake, steer], dim=1)              # [B, 3]
-
-
-
-# Turn Np obs into Torch input for Network
-class NpToTorchObsWrapper(gym.ObservationWrapper):
-
-    def __init__(self, env, device="cpu"):
-        super().__init__(env)
-        self.device = device
-
-    def observation(self, obs):
-
-        depth_image = self.preprocess_image(obs["depth_camera"])
-        seg_image = self.preprocess_image(obs["seg_camera"])
-        flattened_obs = self.flatten_observation(obs)
-        
-        return {
-            "depth_camera": depth_image.to(self.device),
-            "seg_camera": seg_image.to(self.device),
-            "sensor_data": flattened_obs.to(self.device),
-        }
-
-    @staticmethod
-    def flatten_observation(obs):
-
-        components = [
-            obs["collision_sensor"],
-            obs["velocity"],
-            obs["acceleration"],
-            obs["angular_velocity"],
-            obs["throttle"],
-            obs["brake"],
-            obs["steer"],
-            obs["speed"]
-        ]
-        return torch.tensor(np.concatenate(components, axis=0).astype(np.float32))  # [14]
-
-    @staticmethod
-    def preprocess_image(np_img_array):
-        img_tensor = torch.tensor(np_img_array).permute(2, 0, 1).float()  # Convert from HWC -> CHW: [C, H, W]
-        return img_tensor
-
-
-
-# Turn Torch output into Np action for Environment
-class TorchToNpyActionWrapper(gym.ActionWrapper):
-
-    def __init__(self, env, device="cpu"):
-        super().__init__(env)
-        self.device = device
-
-    def action(self, action):
-
-        action = {
-            "throttle": action[:, 0].detach().cpu().numpy()[0], # no more dimensions, just scalers
-            "brake": action[:, 1].detach().cpu().numpy()[0],
-            "steer": action[:, 2].detach().cpu().numpy()[0],
-        }
-
-        return action
+        return torch.cat([depth_f, seg_f, sensor_f], dim=1)
